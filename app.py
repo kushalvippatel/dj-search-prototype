@@ -2,8 +2,9 @@ from flask import Flask, render_template, request, jsonify
 import requests
 from bs4 import BeautifulSoup
 import os
-import json
 import re
+import socket
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 import time as time_module
@@ -49,6 +50,62 @@ DEFAULT_HEADERS = {
 # Session for connection pooling
 session = requests.Session()
 session.headers.update(DEFAULT_HEADERS)
+
+# Domains the server is allowed to fetch on behalf of a client. Requests to
+# anything else (internal hosts, cloud metadata endpoints, arbitrary sites)
+# are rejected to prevent Server-Side Request Forgery (SSRF).
+ALLOWED_SOURCE_DOMAINS = {
+    'soundcloud.com', 'youtube.com', 'youtu.be', 'spotify.com',
+}
+ALLOWED_BANDCAMP_DOMAINS = {'bandcamp.com'}
+
+
+def _resolves_to_public_ip(hostname):
+    """Return True only if every address the hostname resolves to is a
+    globally routable (public) IP. Blocks loopback/private/link-local/reserved
+    ranges so an allowed-looking host can't be pointed at internal services."""
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None)
+    except (socket.gaierror, UnicodeError):
+        return False
+
+    for info in addr_infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+def is_allowed_url(url, allowed_domains):
+    """Validate a client-supplied URL before the server fetches it.
+
+    Requires http(s), a host in the allowlist (exact match or subdomain), and
+    a hostname that resolves only to public IPs."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+
+    if parsed.scheme not in ('http', 'https'):
+        return False
+
+    host = parsed.hostname
+    if not host:
+        return False
+    host = host.lower()
+
+    domain_ok = any(host == d or host.endswith('.' + d) for d in allowed_domains)
+    if not domain_ok:
+        return False
+
+    return _resolves_to_public_ip(host)
 
 # Amazon location detection
 def detect_amazon_store(request_obj):
@@ -413,7 +470,9 @@ def search_amazon(artist, title, store_domain='amazon.com'):
                 
                 # Generate iframe embed HTML for Amazon product
                 # Note: Amazon may block iframes, but we'll try anyway
-                embed_html = f'<iframe style="border: 0; width: 100%; height: 400px;" src="{product_url}" seamless sandbox="allow-same-origin allow-scripts allow-popups allow-forms"></iframe>'
+                # NOTE: never combine allow-scripts with allow-same-origin --
+                # together they let the framed page remove its own sandbox.
+                embed_html = f'<iframe style="border: 0; width: 100%; height: 400px;" src="{product_url}" seamless sandbox="allow-scripts allow-popups allow-forms"></iframe>'
                 
                 products.append({
                     'title': title_text,
@@ -653,17 +712,22 @@ def get_amazon_store():
 def search():
     url = request.json.get('url')
     amazon_store = request.json.get('amazon_store', 'amazon.com')
-    
+
     if not url:
         return jsonify({'error': 'No URL provided'})
-    
+
+    if not is_allowed_url(url, ALLOWED_SOURCE_DOMAINS):
+        return jsonify({'error': 'Unsupported or disallowed URL. Use a SoundCloud, YouTube, or Spotify link.'})
+
+    host = (urlparse(url).hostname or '').lower()
+
     # Use concurrent execution for better performance
     with ThreadPoolExecutor(max_workers=3) as executor:
         # Determine the source URL type and fetch data
-        if 'youtube.com' in url or 'youtu.be' in url:
+        if host == 'youtu.be' or host.endswith('youtube.com'):
             data_future = executor.submit(get_youtube_data, url)
             source = 'YouTube'
-        elif 'spotify.com' in url:
+        elif host.endswith('spotify.com'):
             data_future = executor.submit(get_spotify_data, url)
             source = 'Spotify'
         else:
@@ -721,7 +785,10 @@ def check_track():
     track_url = request.json.get('track_url')
     if not track_url:
         return jsonify({'error': 'No track URL provided'})
-    
+
+    if not is_allowed_url(track_url, ALLOWED_SOURCE_DOMAINS):
+        return jsonify({'error': 'Disallowed track URL'})
+
     track_info = get_track_info(track_url)
     return jsonify(track_info)
 
@@ -731,7 +798,10 @@ def get_bandcamp_embed_route():
     bandcamp_url = request.json.get('url')
     if not bandcamp_url:
         return jsonify({'error': 'No URL provided'})
-    
+
+    if not is_allowed_url(bandcamp_url, ALLOWED_BANDCAMP_DOMAINS):
+        return jsonify({'error': 'Disallowed URL'})
+
     embed_html = get_bandcamp_embed(bandcamp_url)
     if embed_html:
         return jsonify({'embed_html': embed_html})

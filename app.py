@@ -9,6 +9,18 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 import time as time_module
 
+# Local development opt-in: verify outbound TLS against the OS certificate
+# store instead of certifi's bundle. Useful on dev machines behind
+# TLS-intercepting proxies whose root CA only exists in the OS store.
+# Requires `pip install truststore`. Off by default; no effect in production.
+if os.environ.get('USE_OS_TRUSTSTORE') == '1':
+    try:
+        import truststore
+        truststore.inject_into_ssl()
+    except ImportError:
+        print("USE_OS_TRUSTSTORE=1 is set but 'truststore' is not installed; "
+              "run: pip install truststore")
+
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0

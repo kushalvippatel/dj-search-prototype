@@ -13,27 +13,10 @@ app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
-# Amazon store mapping
-AMAZON_STORES = {
-    'US': 'amazon.com',
-    'UK': 'amazon.co.uk',
-    'DE': 'amazon.de',
-    'FR': 'amazon.fr',
-    'IT': 'amazon.it',
-    'ES': 'amazon.es',
-    'CA': 'amazon.ca',
-    'JP': 'amazon.co.jp',
-    'AU': 'amazon.com.au',
-    'BR': 'amazon.com.br',
-    'MX': 'amazon.com.mx',
-    'IN': 'amazon.in',
-    'NL': 'amazon.nl',
-    'SE': 'amazon.se',
-    'PL': 'amazon.pl',
-    'SG': 'amazon.sg',
-    'TR': 'amazon.com.tr',
-    'AE': 'amazon.ae',
-    'SA': 'amazon.sa'
+# iTunes storefront country codes we support (ISO 3166-1 alpha-2)
+ITUNES_COUNTRIES = {
+    'US', 'GB', 'DE', 'FR', 'IT', 'ES', 'CA', 'JP', 'AU', 'BR',
+    'MX', 'IN', 'NL', 'SE', 'PL', 'SG', 'TR', 'AE', 'SA',
 }
 
 # Default headers for requests
@@ -57,7 +40,6 @@ session.headers.update(DEFAULT_HEADERS)
 ALLOWED_SOURCE_DOMAINS = {
     'soundcloud.com', 'youtube.com', 'youtu.be', 'spotify.com',
 }
-ALLOWED_BANDCAMP_DOMAINS = {'bandcamp.com'}
 
 
 def _resolves_to_public_ip(hostname):
@@ -107,15 +89,14 @@ def is_allowed_url(url, allowed_domains):
 
     return _resolves_to_public_ip(host)
 
-# Amazon location detection
-def detect_amazon_store(request_obj):
-    """Detect Amazon store based on request headers."""
-    # Try to get country from Accept-Language header
+# Storefront country detection
+def detect_country(request_obj):
+    """Detect the user's iTunes storefront country from Accept-Language."""
     accept_language = request_obj.headers.get('Accept-Language', '')
-    
+
     # Map common language codes to countries
     lang_to_country = {
-        'en-US': 'US', 'en-GB': 'UK', 'en-CA': 'CA', 'en-AU': 'AU',
+        'en-US': 'US', 'en-GB': 'GB', 'en-CA': 'CA', 'en-AU': 'AU',
         'de': 'DE', 'de-DE': 'DE',
         'fr': 'FR', 'fr-FR': 'FR',
         'it': 'IT', 'it-IT': 'IT',
@@ -128,14 +109,47 @@ def detect_amazon_store(request_obj):
         'tr': 'TR', 'tr-TR': 'TR',
         'ar': 'AE', 'ar-AE': 'AE', 'ar-SA': 'SA'
     }
-    
-    # Check Accept-Language
+
     for lang, country in lang_to_country.items():
         if lang in accept_language:
-            return AMAZON_STORES.get(country, 'amazon.com')
-    
+            return country
+
     # Default to US
-    return 'amazon.com'
+    return 'US'
+
+
+# Noise commonly appended to video titles that pollutes store searches,
+# e.g. "(Official Video)", "[4K Remaster]", "(Lyric Video)".
+TITLE_NOISE_RE = re.compile(
+    r'[(\[][^()\[\]]*\b(official|video|audio|lyric|lyrics|visuali[sz]er|'
+    r'remaster(ed)?|hd|hq|4k|mv|music video|out now|premiere|free (dl|download))\b[^()\[\]]*[)\]]',
+    re.IGNORECASE,
+)
+
+
+def clean_track_query(artist, title):
+    """Build a store search query from scraped artist/title.
+
+    Video titles usually embed the artist ("Rick Astley - Never Gonna ...")
+    and marketing noise ("(Official Video)"); naive "artist + title"
+    concatenation duplicates the artist and rarely matches store catalogs."""
+    artist = (artist or '').strip()
+    title = (title or '').strip()
+
+    title = TITLE_NOISE_RE.sub('', title).strip()
+
+    # Drop a leading "Artist -" / "Artist:" prefix duplicated in the title
+    if artist and title.lower().startswith(artist.lower()):
+        rest = title[len(artist):].lstrip()
+        if rest[:1] in ('-', ':', '|', '–', '—'):
+            title = rest[1:].strip()
+        elif rest and rest != title:
+            title = rest
+
+    # Collapse leftover whitespace/separators
+    title = re.sub(r'\s{2,}', ' ', title).strip(' -–—|')
+
+    return f"{artist} {title}".strip()
 
 # Request helper with retry and timeout
 def make_request(url, headers=None, timeout=10, max_retries=3, retry_delay=1):
@@ -167,6 +181,7 @@ def get_soundcloud_data(url):
         title = soup.find('meta', property='og:title')['content']
         
         # Get artist name and clean it up
+        artist = 'Unknown Artist'
         artist_meta = soup.find('meta', property='soundcloud:user')
         if artist_meta:
             artist = artist_meta['content']
@@ -198,346 +213,133 @@ def get_soundcloud_data(url):
     except Exception as e:
         return {'error': str(e)}
 
+def build_bandcamp_embed(item_type, item_id):
+    """Build Bandcamp player iframe HTML from a numeric ID we obtained from
+    Bandcamp's own search API. The ID is validated as an integer, so no
+    scraped markup ever reaches the embed."""
+    item_id = int(item_id)
+    kind = 'album' if item_type == 'a' else 'track'
+    embed_url = (
+        f"https://bandcamp.com/EmbeddedPlayer/{kind}={item_id}"
+        f"/size=large/bgcol=ffffff/linkcol=0687f5/tracklist=false"
+        f"{'' if kind == 'album' else '/artwork=small'}/transparent=true/"
+    )
+    return f'<iframe style="border: 0; width: 100%; height: 120px;" src="{embed_url}" seamless></iframe>'
+
+
 def search_bandcamp(artist, title):
-    search_query = f"{artist} {title}".strip()
+    """Search Bandcamp via its public autocomplete JSON API.
+
+    The old HTML scrape broke when Bandcamp moved search results to
+    client-side rendering; the JSON endpoint returns structured results
+    including the numeric IDs needed for player embeds."""
+    search_query = clean_track_query(artist, title)
     if not search_query:
         return {'search_url': '', 'tracks': []}
-    
+
     search_url = f"https://bandcamp.com/search?q={requests.utils.quote(search_query)}"
-    
+
     try:
-        response = make_request(search_url)
-        if not response:
-            print(f"Bandcamp search: Failed to fetch {search_url}")
-            return {'search_url': search_url, 'tracks': []}
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
+        response = session.post(
+            'https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic',
+            json={
+                'search_text': search_query,
+                'search_filter': 't',  # tracks
+                'full_page': False,
+                'fan_id': None,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        results = (response.json().get('auto') or {}).get('results') or []
+
         tracks = []
-        seen_urls = set()
-        
-        # Find track/album links in search results - try multiple methods
-        all_links = soup.find_all('a', href=True)
-        
-        print(f"Bandcamp search: Found {len(all_links)} total links")
-        
-        for link in all_links:
-            href = link.get('href', '')
-            if not href:
+        for item in results:
+            item_type = item.get('type')
+            item_id = item.get('id')
+            item_url = item.get('item_url_path')
+            if item_type not in ('t', 'a') or not item_id or not item_url:
                 continue
-            
-            # Check for Bandcamp track/album URLs - be more flexible
-            is_bandcamp_url = False
-            if '/album/' in href or '/track/' in href:
-                is_bandcamp_url = True
-            elif '.bandcamp.com' in href and ('album' in href or 'track' in href):
-                is_bandcamp_url = True
-            
-            if not is_bandcamp_url:
-                continue
-            
-            # Handle both relative and absolute URLs
-            if href.startswith('/'):
-                full_url = f"https://bandcamp.com{href}"
-            elif href.startswith('http'):
-                full_url = href
-            elif '.bandcamp.com' in href:
-                full_url = f"https://{href}" if not href.startswith('http') else href
-            else:
-                full_url = f"https://bandcamp.com/{href}"
-            
-            # Normalize URL (remove query params and fragments for comparison)
-            normalized_url = full_url.split('?')[0].split('#')[0]
-            
-            # Skip if we already have this URL
-            if normalized_url in seen_urls:
-                continue
-            seen_urls.add(normalized_url)
-            
-            # Get link text for title
-            link_text = link.get_text().strip()
-            if not link_text:
-                # Try to find title in parent elements
-                parent = link.parent
-                if parent:
-                    link_text = parent.get_text().strip()[:100]  # Limit length
-            if not link_text:
-                link_text = 'Unknown'
-            
-            # Try to get embed HTML, but add track even if it fails
-            embed_html = get_bandcamp_embed(full_url)
-            
+
+            band = (item.get('band_name') or '').strip()
+            name = (item.get('name') or '').strip()
+            try:
+                embed_html = build_bandcamp_embed(item_type, item_id)
+            except (TypeError, ValueError):
+                embed_html = None
+
             tracks.append({
-                'url': full_url,
-                'embed_html': embed_html,  # Can be None
-                'title': link_text
+                'url': item_url,
+                'embed_html': embed_html,
+                'title': f"{band} - {name}".strip(' -'),
             })
-            
-            if len(tracks) >= 10:  # Get more tracks, filter by embed later if needed
+            if len(tracks) >= 10:
                 break
-        
-        print(f"Bandcamp search: Found {len(tracks)} tracks")
-        
-        result = {
-            'search_url': search_url,
-            'tracks': tracks
-        }
-        
-        return result
+
+        return {'search_url': search_url, 'tracks': tracks}
     except Exception as e:
         print(f"Bandcamp search error: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return {'search_url': search_url, 'tracks': []}
 
-def get_bandcamp_embed(bandcamp_url):
-    """Generate Bandcamp iframe embed HTML from a Bandcamp URL by scraping the page for numeric IDs."""
-    try:
-        # Normalize the URL
-        if not bandcamp_url.startswith('http'):
-            if bandcamp_url.startswith('/'):
-                bandcamp_url = f"https://bandcamp.com{bandcamp_url}"
-            else:
-                bandcamp_url = f"https://{bandcamp_url}"
-        
-        # Fetch the Bandcamp page to extract numeric IDs
-        response = make_request(bandcamp_url)
-        if not response:
-            return None
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Method 1: Look for existing embed code in the page
-        embed_iframe = soup.find('iframe', {'src': lambda x: x and 'bandcamp.com/EmbeddedPlayer' in x})
-        if embed_iframe:
-            # Found an iframe, extract and modify it
-            embed_src = embed_iframe.get('src')
-            # Adjust height for our display (120px instead of 470px)
-            embed_html = f'<iframe style="border: 0; width: 100%; height: 120px;" src="{embed_src}" seamless></iframe>'
-            return embed_html
-        
-        # Method 2: Extract numeric IDs from JavaScript or data attributes
-        track_id = None
-        album_id = None
-        
-        # Look for data attributes
-        track_elem = soup.find(attrs={'data-track-id': True})
-        if track_elem:
-            track_id = track_elem.get('data-track-id')
-        
-        album_elem = soup.find(attrs={'data-album-id': True})
-        if album_elem:
-            album_id = album_elem.get('data-album-id')
-        
-        # Search in JavaScript for numeric IDs
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string:
-                script_text = script.string
-                
-                # Look for patterns like "album_id": 1044201631 or album_id:1044201631
-                album_match = re.search(r'["\']?album_id["\']?\s*[:=]\s*(\d+)', script_text)
-                if album_match and not album_id:
-                    album_id = album_match.group(1)
-                
-                # Look for track_id
-                track_match = re.search(r'["\']?track_id["\']?\s*[:=]\s*(\d+)', script_text)
-                if track_match and not track_id:
-                    track_id = track_match.group(1)
-                
-                # Try TralbumData pattern - more comprehensive
-                tralbum_patterns = [
-                    r'TralbumData\s*=\s*\{[^}]*["\']?id["\']?\s*[:=]\s*(\d+)',
-                    r'var\s+TralbumData\s*=\s*\{[^}]*["\']?id["\']?\s*[:=]\s*(\d+)',
-                    r'["\']?id["\']?\s*[:=]\s*(\d+)[^}]*TralbumData',
-                ]
-                for pattern in tralbum_patterns:
-                    tralbum_match = re.search(pattern, script_text, re.DOTALL)
-                    if tralbum_match:
-                        found_id = tralbum_match.group(1)
-                        if '/track/' in bandcamp_url and not track_id:
-                            track_id = found_id
-                        elif '/album/' in bandcamp_url and not album_id:
-                            album_id = found_id
-                        break
-                
-                # Look for embed URLs in the page that contain IDs
-                embed_url_match = re.search(r'bandcamp\.com/EmbeddedPlayer/(?:album=(\d+)|track=(\d+))', script_text)
-                if embed_url_match:
-                    if embed_url_match.group(1) and not album_id:
-                        album_id = embed_url_match.group(1)
-                    if embed_url_match.group(2) and not track_id:
-                        track_id = embed_url_match.group(2)
-                
-        # Look for data-tralbum-id or similar attributes in HTML (outside script loop)
-        tralbum_elem = soup.find(attrs={'data-tralbum-id': True})
-        if tralbum_elem:
-            tralbum_id = tralbum_elem.get('data-tralbum-id')
-            if '/track/' in bandcamp_url and not track_id:
-                track_id = tralbum_id
-            elif '/album/' in bandcamp_url and not album_id:
-                album_id = tralbum_id
-        
-        # Also try to find IDs in the page URL or meta tags
-        meta_album = soup.find('meta', {'property': 'og:url'})
-        if meta_album:
-            meta_url = meta_album.get('content', '')
-            # Extract IDs from URL if present
-            album_match = re.search(r'/album/(\d+)', meta_url)
-            if album_match and not album_id:
-                album_id = album_match.group(1)
-            track_match = re.search(r'/track/(\d+)', meta_url)
-            if track_match and not track_id:
-                track_id = track_match.group(1)
-        
-        # Build embed URL with found IDs
-        if album_id:
-            if track_id:
-                # Both album and track - use track format with album context
-                embed_url = f"https://bandcamp.com/EmbeddedPlayer/album={album_id}/size=large/bgcol=ffffff/linkcol=0687f5/tracklist=false/track={track_id}/transparent=true/"
-            else:
-                # Just album
-                embed_url = f"https://bandcamp.com/EmbeddedPlayer/album={album_id}/size=large/bgcol=ffffff/linkcol=0687f5/tracklist=false/transparent=true/"
-        elif track_id:
-            # Just track
-            embed_url = f"https://bandcamp.com/EmbeddedPlayer/track={track_id}/size=large/bgcol=ffffff/linkcol=0687f5/tracklist=false/artwork=small/transparent=true/"
-        else:
-            # Couldn't find IDs, return None
-            print(f"Could not extract Bandcamp IDs from: {bandcamp_url}")
-            return None
-        
-        # Generate iframe HTML
-        embed_html = f'<iframe style="border: 0; width: 100%; height: 120px;" src="{embed_url}" seamless></iframe>'
-        
-        return embed_html
-    except Exception as e:
-        print(f"Bandcamp embed error: {str(e)}")
-        return None
+def search_itunes(artist, title, country='US'):
+    """Search the iTunes Store via Apple's public Search API.
 
-def search_amazon(artist, title, store_domain='amazon.com'):
-    """Search Amazon and return product previews."""
-    search_query = f"{artist} {title}"
-    search_url = f"https://www.{store_domain}/s?k={requests.utils.quote(search_query)}&i=digital-music"
-    
+    Replaces the old Amazon HTML scraping, which Amazon's bot detection
+    reduced to empty shells. The iTunes API is free, keyless, and returns
+    prices, artwork, store links, and 30-second audio previews."""
+    if country not in ITUNES_COUNTRIES:
+        country = 'US'
+
+    search_query = clean_track_query(artist, title)
+    if not search_query:
+        return {'search_url': '', 'products': [], 'country': country}
+
+    search_url = (
+        f"https://music.apple.com/{country.lower()}/search?term="
+        f"{requests.utils.quote(search_query)}"
+    )
+
     try:
-        # Use more realistic headers for Amazon
-        amazon_headers = DEFAULT_HEADERS.copy()
-        amazon_headers['Referer'] = f'https://www.{store_domain}/'
-        
-        response = make_request(search_url, headers=amazon_headers, timeout=15)
-        if not response:
-            return {'search_url': search_url, 'products': []}
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
+        response = session.get(
+            'https://itunes.apple.com/search',
+            params={
+                'term': search_query,
+                'media': 'music',
+                'entity': 'song',
+                'limit': 5,
+                'country': country,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        results = response.json().get('results') or []
+
         products = []
-        
-        # Find product containers (Amazon's structure may vary)
-        product_containers = soup.find_all('div', {'data-component-type': 's-search-result'})
-        
-        for container in product_containers[:5]:  # Limit to 5 products
-            try:
-                # Extract product title
-                title_elem = container.find('h2', class_='a-size-mini')
-                if not title_elem:
-                    title_elem = container.find('h2')
-                title_text = title_elem.get_text().strip() if title_elem else 'Unknown'
-                
-                # Extract product URL
-                link_elem = container.find('a', class_='a-link-normal')
-                if not link_elem:
-                    link_elem = container.find('h2').find('a') if container.find('h2') else None
-                
-                if link_elem and link_elem.get('href'):
-                    product_url = link_elem['href']
-                    if not product_url.startswith('http'):
-                        product_url = f"https://www.{store_domain}{product_url}"
-                else:
-                    continue
-                
-                # Extract price
-                price_elem = container.find('span', class_='a-price-whole')
-                price = price_elem.get_text().strip() if price_elem else None
-                if price:
-                    currency = container.find('span', class_='a-price-symbol')
-                    currency_symbol = currency.get_text().strip() if currency else '$'
-                    price = f"{currency_symbol}{price}"
-                
-                # Extract image
-                img_elem = container.find('img', class_='s-image')
-                image_url = img_elem.get('src') if img_elem else None
-                
-                # Try to get preview data
-                preview_data = get_amazon_preview(product_url, store_domain)
-                
-                # Generate iframe embed HTML for Amazon product
-                # Note: Amazon may block iframes, but we'll try anyway
-                # NOTE: never combine allow-scripts with allow-same-origin --
-                # together they let the framed page remove its own sandbox.
-                embed_html = f'<iframe style="border: 0; width: 100%; height: 400px;" src="{product_url}" seamless sandbox="allow-scripts allow-popups allow-forms"></iframe>'
-                
-                products.append({
-                    'title': title_text,
-                    'url': product_url,
-                    'price': price,
-                    'image': image_url,
-                    'preview': preview_data,
-                    'embed_html': embed_html
-                })
-            except Exception as e:
-                print(f"Error parsing Amazon product: {str(e)}")
+        for item in results:
+            track_name = (item.get('trackName') or '').strip()
+            artist_name = (item.get('artistName') or '').strip()
+            track_url = item.get('trackViewUrl')
+            if not track_name or not track_url:
                 continue
-        
-        result = {
-            'search_url': search_url,
-            'products': products,
-            'store_domain': store_domain
-        }
-        
-        return result
-    except Exception as e:
-        print(f"Amazon search error: {str(e)}")
-        return {'search_url': search_url, 'products': [], 'store_domain': store_domain}
 
-def get_amazon_preview(product_url, store_domain='amazon.com'):
-    """Scrape Amazon product page for preview data."""
-    try:
-        amazon_headers = DEFAULT_HEADERS.copy()
-        amazon_headers['Referer'] = f'https://www.{store_domain}/'
-        
-        response = make_request(product_url, headers=amazon_headers, timeout=15)
-        if not response:
-            return None
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Look for audio preview
-        preview_audio = None
-        audio_elem = soup.find('audio', {'id': 'dmusic-preview-player'})
-        if audio_elem:
-            source_elem = audio_elem.find('source')
-            if source_elem and source_elem.get('src'):
-                preview_audio = source_elem['src']
-        
-        # Extract additional product info
-        product_info = {
-            'preview_audio': preview_audio,
-            'description': None,
-            'artist': None
-        }
-        
-        # Try to get description
-        desc_elem = soup.find('div', {'id': 'productDescription'})
-        if desc_elem:
-            product_info['description'] = desc_elem.get_text().strip()[:200]  # Limit length
-        
-        # Try to get artist/contributor info
-        contributor_elem = soup.find('a', {'class': 'contributorNameID'})
-        if contributor_elem:
-            product_info['artist'] = contributor_elem.get_text().strip()
-        
-        return product_info
+            # trackPrice can be missing, or negative for album-only tracks
+            price = item.get('trackPrice')
+            currency = item.get('currency') or ''
+            price_text = f"{price:.2f} {currency}".strip() if isinstance(price, (int, float)) and price >= 0 else None
+
+            products.append({
+                'title': f"{artist_name} - {track_name}".strip(' -'),
+                'url': track_url,
+                'price': price_text,
+                'image': item.get('artworkUrl100'),
+                'preview_audio': item.get('previewUrl'),
+                'album': item.get('collectionName'),
+            })
+
+        return {'search_url': search_url, 'products': products, 'country': country}
     except Exception as e:
-        print(f"Amazon preview error: {str(e)}")
-        return None
+        print(f"iTunes search error: {str(e)}")
+        return {'search_url': search_url, 'products': [], 'country': country}
 
 def get_youtube_data(url):
     try:
@@ -702,16 +504,15 @@ def get_track_info(track_url):
 def home():
     return render_template('index.html')
 
-@app.route('/get-amazon-store', methods=['GET'])
-def get_amazon_store():
-    """Get detected Amazon store for the user."""
-    detected_store = detect_amazon_store(request)
-    return jsonify({'store_domain': detected_store})
+@app.route('/get-country', methods=['GET'])
+def get_country():
+    """Get the detected iTunes storefront country for the user."""
+    return jsonify({'country': detect_country(request)})
 
 @app.route('/search', methods=['POST'])
 def search():
     url = request.json.get('url')
-    amazon_store = request.json.get('amazon_store', 'amazon.com')
+    country = request.json.get('country', 'US')
 
     if not url:
         return jsonify({'error': 'No URL provided'})
@@ -734,23 +535,23 @@ def search():
             data_future = executor.submit(get_soundcloud_data, url)
             source = 'SoundCloud'
         
-        # Fetch Bandcamp and Amazon data concurrently
+        # Fetch Bandcamp and iTunes data concurrently
         data = data_future.result()
-        
+
         if 'error' in data:
             return jsonify(data)
-        
+
         bandcamp_future = executor.submit(search_bandcamp, data['artist'], data['title'])
-        amazon_future = executor.submit(search_amazon, data['artist'], data['title'], amazon_store)
-        
+        itunes_future = executor.submit(search_itunes, data['artist'], data['title'], country)
+
         bandcamp_result = bandcamp_future.result()
-        amazon_result = amazon_future.result()
-    
+        itunes_result = itunes_future.result()
+
     return jsonify({
         'source': source,
         'download_url': data.get('download_url'),
         'bandcamp': bandcamp_result,
-        'amazon': amazon_result,
+        'itunes': itunes_result,
         'title': data['title'],
         'artist': data['artist']
     })
@@ -759,25 +560,25 @@ def search():
 @app.route('/keyword-search', methods=['POST'])
 def keyword_search():
     keywords = request.json.get('keywords')
-    amazon_store = request.json.get('amazon_store', 'amazon.com')
-    
+    country = request.json.get('country', 'US')
+
     if not keywords:
         return jsonify({'error': 'No keywords provided'})
-    
+
     # Use concurrent execution for better performance
     with ThreadPoolExecutor(max_workers=3) as executor:
         soundcloud_future = executor.submit(search_soundcloud, keywords)
         bandcamp_future = executor.submit(search_bandcamp, keywords, '')
-        amazon_future = executor.submit(search_amazon, keywords, '', amazon_store)
-        
+        itunes_future = executor.submit(search_itunes, keywords, '', country)
+
         soundcloud_results = soundcloud_future.result()
         bandcamp_result = bandcamp_future.result()
-        amazon_result = amazon_future.result()
-    
+        itunes_result = itunes_future.result()
+
     return jsonify({
         'soundcloud': soundcloud_results if soundcloud_results else None,
         'bandcamp': bandcamp_result,
-        'amazon': amazon_result
+        'itunes': itunes_result
     })
 
 @app.route('/check-track', methods=['POST'])
@@ -791,22 +592,6 @@ def check_track():
 
     track_info = get_track_info(track_url)
     return jsonify(track_info)
-
-@app.route('/get-bandcamp-embed', methods=['POST'])
-def get_bandcamp_embed_route():
-    """Get Bandcamp embed HTML for a URL."""
-    bandcamp_url = request.json.get('url')
-    if not bandcamp_url:
-        return jsonify({'error': 'No URL provided'})
-
-    if not is_allowed_url(bandcamp_url, ALLOWED_BANDCAMP_DOMAINS):
-        return jsonify({'error': 'Disallowed URL'})
-
-    embed_html = get_bandcamp_embed(bandcamp_url)
-    if embed_html:
-        return jsonify({'embed_html': embed_html})
-    else:
-        return jsonify({'error': 'Could not generate embed'})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

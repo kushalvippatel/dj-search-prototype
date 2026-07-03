@@ -27,6 +27,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Local tooling config (machine-specific paths)
+.claude/
+
 # IDE
 .vscode/
 .idea/
